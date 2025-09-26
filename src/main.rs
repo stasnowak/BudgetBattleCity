@@ -274,13 +274,33 @@ fn move_with_collisions(
 }
 
 fn bullet_wall_cull(
+    time: Res<Time>,
     mut commands: Commands,
-    q_bullets: Query<(Entity, &Transform, &Size), With<Bullet>>,
+    q_bullets: Query<(Entity, &Transform, &Size, &Velocity), With<Bullet>>,
     walls: Query<(&Transform, &Size), With<Wall>>,
 ) {
-    for (e, t, s) in &q_bullets {
-        if overlaps_any(t.translation.truncate(), s.0 * 0.5, &walls) {
+    let dt = time.delta_secs();
+
+    for (e, t, s, v) in &q_bullets {
+        let pos = t.translation.truncate();
+        let half = s.0 * 0.5;
+
+        // If somehow inside a wall, cull immediately.
+        if overlaps_any(pos, half, &walls) {
             commands.entity(e).despawn();
+            continue;
+        }
+
+        // Predict a tiny forward step; if that would collide, treat it as a hit and despawn.
+        let speed = v.length();
+        if speed > 0.0 {
+            let dir = Vec2::new(v.x / speed, v.y / speed);
+            // Match sweep_axis granularity (6 steps) with a small safety margin
+            let epsilon = (speed * dt) / 6.0 + 0.5;
+            let ahead_pos = pos + dir * epsilon;
+            if overlaps_any(ahead_pos, half, &walls) {
+                commands.entity(e).despawn();
+            }
         }
     }
 }

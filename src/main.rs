@@ -21,12 +21,21 @@ const ENEMY_SPEED: f32 = 180.0;
 const ENEMY_SIZE: Vec2 = Vec2::new(28.0, 28.0);
 const ENEMY_CAP: usize = 24;
 const ENEMY_SPAWN_SECS: f32 = 1.25;
+const ENEMY_FIRE_SECS: f32 = 1.1;
 
 // === Components ===
 #[derive(Component)] struct Player;
 #[derive(Component)] struct Bullet;
 #[derive(Component)] struct Enemy;
 #[derive(Component)] struct Wall;
+
+#[derive(Component)] struct EnemyGun(Timer);
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum Faction {
+    Player,
+    Enemy,
+}
 
 #[derive(Component, Deref, DerefMut)]
 struct Velocity(Vec2);
@@ -49,6 +58,50 @@ struct SpawnPoints {
 
 #[derive(Resource)]
 struct PlayerStart(Vec2);
+
+#[derive(Event, Default)]
+struct RestartEvent;
+
+fn on_restart_cleanup(
+    mut commands: Commands,
+    mut ev: EventReader<RestartEvent>,
+    mut cooldown: ResMut<FireCooldown>,
+    mut enemy_timer: ResMut<EnemySpawnTimer>,
+    q_players: Query<Entity, With<Player>>,
+    q_enemies: Query<Entity, With<Enemy>>,
+    q_walls: Query<Entity, With<Wall>>,
+    q_bullets: Query<Entity, With<Bullet>>,
+) {
+    let mut triggered = false;
+    for _ in ev.read() { triggered = true; }
+    if !triggered { return; }
+
+    for e in q_players.iter() { commands.entity(e).despawn(); }
+    for e in q_enemies.iter() { commands.entity(e).despawn(); }
+    for e in q_walls.iter() { commands.entity(e).despawn(); }
+    for e in q_bullets.iter() { commands.entity(e).despawn(); }
+
+    cooldown.0.reset();
+    enemy_timer.0.reset();
+}
+
+fn on_restart_build_maze(mut commands: Commands, mut ev: EventReader<RestartEvent>) {
+    let mut triggered = false;
+    for _ in ev.read() { triggered = true; }
+    if !triggered { return; }
+    build_maze(commands);
+}
+
+fn on_restart_spawn_player(
+    mut commands: Commands,
+    start: Option<Res<PlayerStart>>,
+    mut ev: EventReader<RestartEvent>,
+) {
+    let mut triggered = false;
+    for _ in ev.read() { triggered = true; }
+    if !triggered { return; }
+    spawn_player(commands, start);
+}
 
 // 20x15 maze: exactly 20 chars per row
 // '#' = wall, 'S' = enemy spawn, 'P' = player start, ' ' = floor
@@ -81,6 +134,7 @@ fn main() {
             }),
             ..default()
         }))
+        .add_event::<RestartEvent>()
         .insert_resource(FireCooldown(Timer::from_seconds(0.16, TimerMode::Once)))
         .insert_resource(EnemySpawnTimer(Timer::from_seconds(
             ENEMY_SPAWN_SECS,
@@ -93,6 +147,7 @@ fn main() {
             (
                 player_input,
                 handle_fire,
+                enemy_handle_fire,
                 move_with_collisions,
                 bullet_hits,
                 bullet_wall_cull,
@@ -100,6 +155,10 @@ fn main() {
                 enemy_spawner,      // now mutably advances spawn index
                 clamp_to_arena,
             ),
+        )
+        .add_systems(
+            Update,
+            (on_restart_cleanup, on_restart_build_maze, on_restart_spawn_player).chain(),
         )
         .run();
 }
@@ -223,11 +282,49 @@ fn handle_fire(
         },
         Transform::from_xyz(spawn_pos.x, spawn_pos.y, 0.5).with_rotation(t.rotation),
         Bullet,
+        Faction::Player,
         Velocity(forward * BULLET_SPEED),
         Size(BULLET_SIZE),
     ));
 
     cooldown.0.reset();
+}
+
+fn enemy_handle_fire(
+    time: Res<Time>,
+    mut q_enemies: Query<(&Transform, &Size, &mut EnemyGun), With<Enemy>>,
+    q_player: Query<&Transform, (With<Player>, Without<Enemy>)>,
+    mut commands: Commands,
+) {
+    let Ok(player_t) = q_player.get_single() else { return; };
+    let player_pos = player_t.translation.truncate();
+
+    for (t, esize, mut gun) in &mut q_enemies {
+        gun.0.tick(time.delta());
+        if !gun.0.finished() { continue; }
+
+        let to_player = player_pos - t.translation.truncate();
+        if to_player.length_squared() == 0.0 { continue; }
+
+        let dir = to_player.normalize();
+        let angle = dir.y.atan2(dir.x);
+        let spawn_pos = t.translation.truncate() + dir * (esize.0.x * 0.6);
+
+        commands.spawn((
+            Sprite {
+                color: Color::srgb(1.0, 0.85, 0.2),
+                custom_size: Some(BULLET_SIZE),
+                ..default()
+            },
+            Transform::from_xyz(spawn_pos.x, spawn_pos.y, 0.5).with_rotation(Quat::from_rotation_z(angle)),
+            Bullet,
+            Faction::Enemy,
+            Velocity(dir * BULLET_SPEED),
+            Size(BULLET_SIZE),
+        ));
+
+        gun.0.reset();
+    }
 }
 
 fn enemy_ai_seek_player(
@@ -307,18 +404,32 @@ fn bullet_wall_cull(
 
 fn bullet_hits(
     mut commands: Commands,
-    q_bullets: Query<(Entity, &Transform, &Size), With<Bullet>>,
+    mut restart: EventWriter<RestartEvent>,
+    q_bullets: Query<(Entity, &Transform, &Size, &Faction), With<Bullet>>,
     q_enemies: Query<(Entity, &Transform, &Size), With<Enemy>>,
+    q_player: Query<(Entity, &Transform, &Size), With<Player>>,
 ) {
-    for (b_e, b_t, b_s) in &q_bullets {
+    for (b_e, b_t, b_s, faction) in &q_bullets {
         let b_pos = b_t.translation.truncate();
         let b_half = b_s.0 * 0.5;
 
-        for (e_e, e_t, e_s) in &q_enemies {
-            if aabb_overlap(b_pos, b_half, e_t.translation.truncate(), e_s.0 * 0.5) {
-                commands.entity(b_e).despawn();
-                commands.entity(e_e).despawn();
-                break;
+        match *faction {
+            Faction::Player => {
+                for (e_e, e_t, e_s) in &q_enemies {
+                    if aabb_overlap(b_pos, b_half, e_t.translation.truncate(), e_s.0 * 0.5) {
+                        commands.entity(b_e).despawn();
+                        commands.entity(e_e).despawn();
+                        break;
+                    }
+                }
+            }
+            Faction::Enemy => {
+                if let Ok((_p_e, p_t, p_s)) = q_player.get_single() {
+                    if aabb_overlap(b_pos, b_half, p_t.translation.truncate(), p_s.0 * 0.5) {
+                        commands.entity(b_e).despawn();
+                        restart.send_default();
+                    }
+                }
             }
         }
     }
@@ -358,6 +469,7 @@ fn enemy_spawner(
         Enemy,
         Velocity(Vec2::ZERO),
         Size(ENEMY_SIZE),
+        EnemyGun(Timer::from_seconds(ENEMY_FIRE_SECS, TimerMode::Repeating)),
     ));
 
     spawns.next = (spawns.next + 1) % spawns.points.len();

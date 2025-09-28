@@ -1,5 +1,3 @@
-//! Battle Tanks (Bevy 0.16.1): maze, enemies, collisions — crash-fixed
-
 use bevy::prelude::*;
 use std::time::Duration;
 
@@ -128,7 +126,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Battle Tanks (Bevy 0.16.1)".into(),
+                title: "Battle City (Bevy 0.16.1)".into(),
                 resolution: (ARENA_W, ARENA_H).into(),
                 ..default()
             }),

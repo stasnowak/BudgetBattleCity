@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use std::time::Duration;
+use rand::{Rng, thread_rng};
 
 // === Arena & tiles ===
 const ARENA_W: f32 = 800.0;
@@ -8,7 +9,7 @@ const TILE: f32 = 40.0; // 20x15 grid
 
 // === Player ===
 const PLAYER_SPEED: f32 = 300.0;
-const PLAYER_SIZE: Vec2 = Vec2::new(32.0, 32.0);
+const PLAYER_SIZE: Vec2 = Vec2::new(28.0, 28.0);
 
 // === Bullets ===
 const BULLET_SPEED: f32 = 600.0;
@@ -16,10 +17,15 @@ const BULLET_SIZE: Vec2 = Vec2::new(6.0, 12.0);
 
 // === Enemies ===
 const ENEMY_SPEED: f32 = 180.0;
-const ENEMY_SIZE: Vec2 = Vec2::new(28.0, 28.0);
+const ENEMY_SIZE: Vec2 = Vec2::new(24.0, 24.0);
 const ENEMY_CAP: usize = 24;
 const ENEMY_SPAWN_SECS: f32 = 1.25;
 const ENEMY_FIRE_SECS: f32 = 1.1;
+const ENEMY_DETECT_RADIUS: f32 = 240.0;
+const CHASE_REACTION_SECS: f32 = 0.45;
+const WANDER_CHANGE_MIN: f32 = 1.2;
+const WANDER_CHANGE_MAX: f32 = 2.2;
+const ROAM_SPEED_FACTOR: f32 = 0.75;
 
 // === Components ===
 #[derive(Component)] struct Player;
@@ -40,6 +46,37 @@ struct Velocity(Vec2);
 
 #[derive(Component)]
 struct Size(Vec2);
+
+// === Enemy AI ===
+#[derive(Component)]
+struct EnemyAI {
+    state: EnemyState,
+    think: Timer,
+    roam_dir: Vec2,
+    awareness: f32, // 0.0 .. 1.0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnemyState {
+    Roaming,
+    Chasing,
+}
+
+// === New: Weapon upgrades and pickups ===
+#[derive(Component)]
+struct UpgradePickup;
+
+#[derive(Resource)]
+struct PlayerUpgradeLevel(u8);
+
+const MAX_UPGRADE_STACK: u8 = 3;
+
+fn fire_cooldown_for(level: u8) -> f32 {
+    // Base cooldown reduced by 20% per stack, up to MAX_UPGRADE_STACK
+    let base = 0.16;
+    let factor = 0.8_f32.powi(level.min(MAX_UPGRADE_STACK) as i32);
+    base * factor
+}
 
 // === Resources ===
 #[derive(Resource)]
@@ -65,10 +102,12 @@ fn on_restart_cleanup(
     mut ev: EventReader<RestartEvent>,
     mut cooldown: ResMut<FireCooldown>,
     mut enemy_timer: ResMut<EnemySpawnTimer>,
+    mut upgrade: ResMut<PlayerUpgradeLevel>,
     q_players: Query<Entity, With<Player>>,
     q_enemies: Query<Entity, With<Enemy>>,
     q_walls: Query<Entity, With<Wall>>,
     q_bullets: Query<Entity, With<Bullet>>,
+    q_pickups: Query<Entity, With<UpgradePickup>>,
 ) {
     let mut triggered = false;
     for _ in ev.read() { triggered = true; }
@@ -78,8 +117,11 @@ fn on_restart_cleanup(
     for e in q_enemies.iter() { commands.entity(e).despawn(); }
     for e in q_walls.iter() { commands.entity(e).despawn(); }
     for e in q_bullets.iter() { commands.entity(e).despawn(); }
+    for e in q_pickups.iter() { commands.entity(e).despawn(); }
 
-    cooldown.0.reset();
+    // Reset upgrade level and timers
+    upgrade.0 = 0;
+    cooldown.0 = Timer::from_seconds(fire_cooldown_for(0), TimerMode::Once);
     enemy_timer.0.reset();
 }
 
@@ -138,6 +180,7 @@ fn main() {
             ENEMY_SPAWN_SECS,
             TimerMode::Repeating,
         )))
+        .insert_resource(PlayerUpgradeLevel(0))
         // was: .add_systems(Startup, (setup_camera, build_maze, spawn_player))
         .add_systems(Startup, (setup_camera, build_maze, spawn_player).chain())
         .add_systems(
@@ -152,6 +195,7 @@ fn main() {
                 enemy_ai_seek_player,
                 enemy_spawner,      // now mutably advances spawn index
                 clamp_to_arena,
+                pickup_collection,
             ),
         )
         .add_systems(
@@ -244,10 +288,11 @@ fn player_input(
     if input.pressed(KeyCode::KeyD) || input.pressed(KeyCode::ArrowRight){ dir.x += 1.0; }
 
     if dir.length_squared() > 0.0 {
-        dir = dir.normalize();
-        let angle = dir.y.atan2(dir.x);
+        // Force a single cardinal direction (tie-breaker favors horizontal when equal)
+        let qdir = quantize_to_cardinal(dir);
+        let angle = qdir.y.atan2(qdir.x);
         transform.rotation = Quat::from_rotation_z(angle);
-        **vel = dir * PLAYER_SPEED;
+        **vel = qdir * PLAYER_SPEED;
     } else {
         **vel = Vec2::ZERO;
     }
@@ -260,6 +305,7 @@ fn handle_fire(
     time: Res<Time>,
     input: Res<ButtonInput<KeyCode>>,
     mut cooldown: ResMut<FireCooldown>,
+    upgrade: Res<PlayerUpgradeLevel>,
     q_player: Query<(&Transform, &Size), With<Player>>,
     mut commands: Commands,
 ) {
@@ -285,26 +331,32 @@ fn handle_fire(
         Size(BULLET_SIZE),
     ));
 
-    cooldown.0.reset();
+    // Set next cooldown based on current upgrade level
+    cooldown.0 = Timer::from_seconds(fire_cooldown_for(upgrade.0), TimerMode::Once);
 }
 
 fn enemy_handle_fire(
     time: Res<Time>,
-    mut q_enemies: Query<(&Transform, &Size, &mut EnemyGun), With<Enemy>>,
+    mut q_enemies: Query<(&Transform, &Size, &mut EnemyGun, &EnemyAI), With<Enemy>>,
     q_player: Query<&Transform, (With<Player>, Without<Enemy>)>,
     mut commands: Commands,
 ) {
     let Ok(player_t) = q_player.get_single() else { return; };
     let player_pos = player_t.translation.truncate();
+    let detect2 = ENEMY_DETECT_RADIUS * ENEMY_DETECT_RADIUS;
 
-    for (t, esize, mut gun) in &mut q_enemies {
+    for (t, esize, mut gun, ai) in &mut q_enemies {
         gun.0.tick(time.delta());
         if !gun.0.finished() { continue; }
 
-        let to_player = player_pos - t.translation.truncate();
-        if to_player.length_squared() == 0.0 { continue; }
+        // Only fire when actively chasing and within detection range
+        if ai.state != EnemyState::Chasing { continue; }
 
-        let dir = to_player.normalize();
+        let to_player = player_pos - t.translation.truncate();
+        if to_player.length_squared() > detect2 { continue; }
+
+        let dir = quantize_to_cardinal(to_player);
+        if dir.length_squared() == 0.0 { continue; }
         let angle = dir.y.atan2(dir.x);
         let spawn_pos = t.translation.truncate() + dir * (esize.0.x * 0.6);
 
@@ -326,15 +378,50 @@ fn enemy_handle_fire(
 }
 
 fn enemy_ai_seek_player(
-    mut q_enemies: Query<(&Transform, &mut Velocity), With<Enemy>>,
+    time: Res<Time>,
+    mut q_enemies: Query<(&Transform, &mut Velocity, &mut EnemyAI), With<Enemy>>,
     q_player: Query<&Transform, (With<Player>, Without<Enemy>)>,
 ) {
     let Ok(player_t) = q_player.get_single() else { return; };
-    let target = player_t.translation.truncate();
+    let player_pos = player_t.translation.truncate();
+    let dt = time.delta_secs();
+    let detect2 = ENEMY_DETECT_RADIUS * ENEMY_DETECT_RADIUS;
 
-    for (t, mut v) in &mut q_enemies {
-        let dir = (target - t.translation.truncate());
-        **v = if dir.length_squared() > 1.0 { dir.normalize() * ENEMY_SPEED } else { Vec2::ZERO };
+    for (t, mut v, mut ai) in &mut q_enemies {
+        ai.think.tick(time.delta());
+
+        let to_player = player_pos - t.translation.truncate();
+        let dist2 = to_player.length_squared();
+
+        // Awareness builds when close, decays when far
+        if dist2 <= detect2 {
+            ai.awareness = (ai.awareness + dt / CHASE_REACTION_SECS).clamp(0.0, 1.0);
+        } else {
+            ai.awareness = (ai.awareness - dt / (CHASE_REACTION_SECS * 1.25)).clamp(0.0, 1.0);
+        }
+
+        match ai.state {
+            EnemyState::Roaming => {
+                if ai.awareness >= 1.0 {
+                    ai.state = EnemyState::Chasing;
+                }
+                if ai.think.finished() {
+                    ai.roam_dir = random_cardinal();
+                    ai.think = Timer::from_seconds(thread_rng().gen_range(WANDER_CHANGE_MIN..WANDER_CHANGE_MAX), TimerMode::Once);
+                }
+                let qdir = quantize_to_cardinal(ai.roam_dir);
+                **v = qdir * (ENEMY_SPEED * ROAM_SPEED_FACTOR);
+            }
+            EnemyState::Chasing => {
+                if ai.awareness <= 0.0 {
+                    ai.state = EnemyState::Roaming;
+                    ai.roam_dir = random_cardinal();
+                    ai.think = Timer::from_seconds(thread_rng().gen_range(WANDER_CHANGE_MIN..WANDER_CHANGE_MAX), TimerMode::Once);
+                }
+                let dir = quantize_to_cardinal(to_player);
+                **v = if dir.length_squared() > 0.0 { dir * ENEMY_SPEED } else { Vec2::ZERO };
+            }
+        }
     }
 }
 
@@ -415,8 +502,20 @@ fn bullet_hits(
             Faction::Player => {
                 for (e_e, e_t, e_s) in &q_enemies {
                     if aabb_overlap(b_pos, b_half, e_t.translation.truncate(), e_s.0 * 0.5) {
+                        let drop_pos = e_t.translation.truncate();
                         commands.entity(b_e).despawn();
                         commands.entity(e_e).despawn();
+                        // Spawn weapon upgrade pickup at enemy position
+                        commands.spawn((
+                            Sprite {
+                                color: Color::srgb(0.2, 0.6, 1.0),
+                                custom_size: Some(Vec2::splat(16.0)),
+                                ..default()
+                            },
+                            Transform::from_xyz(drop_pos.x, drop_pos.y, 0.6),
+                            UpgradePickup,
+                            Size(Vec2::splat(16.0)),
+                        ));
                         break;
                     }
                 }
@@ -442,6 +541,37 @@ fn clamp_to_arena(mut q: Query<&mut Transform, Or<(With<Player>, With<Enemy>, Wi
     }
 }
 
+fn pickup_collection(
+    mut commands: Commands,
+    mut upgrade: ResMut<PlayerUpgradeLevel>,
+    mut q_player: Query<(&Transform, &Size, &mut Sprite), With<Player>>,
+    q_pickups: Query<(Entity, &Transform, &Size), With<UpgradePickup>>,
+) {
+    let Ok((p_t, p_s, mut p_sprite)) = q_player.get_single_mut() else { return; };
+    let p_pos = p_t.translation.truncate();
+    let p_half = p_s.0 * 0.5;
+
+    for (pick_e, pick_t, pick_s) in &q_pickups {
+        let pick_pos = pick_t.translation.truncate();
+        let pick_half = pick_s.0 * 0.5;
+        if aabb_overlap(p_pos, p_half, pick_pos, pick_half) {
+            // Increase upgrade level up to the maximum stack
+            if upgrade.0 < MAX_UPGRADE_STACK {
+                upgrade.0 += 1;
+            }
+            // Change player color based on upgrade level
+            p_sprite.color = match upgrade.0 {
+                0 => Color::srgb(0.2, 0.9, 0.2),
+                1 => Color::srgb(0.2, 0.8, 1.0),
+                2 => Color::srgb(1.0, 0.9, 0.2),
+                _ => Color::srgb(1.0, 0.4, 0.9),
+            };
+            // Remove the pickup
+            commands.entity(pick_e).despawn();
+        }
+    }
+}
+
 fn enemy_spawner(
     time: Res<Time>,
     mut timer: ResMut<EnemySpawnTimer>,
@@ -456,6 +586,7 @@ fn enemy_spawner(
 
     let idx = spawns.next % spawns.points.len();
     let pos = spawns.points[idx];
+    let mut rng = thread_rng();
 
     commands.spawn((
         Sprite {
@@ -468,6 +599,12 @@ fn enemy_spawner(
         Velocity(Vec2::ZERO),
         Size(ENEMY_SIZE),
         EnemyGun(Timer::from_seconds(ENEMY_FIRE_SECS, TimerMode::Repeating)),
+        EnemyAI {
+            state: EnemyState::Roaming,
+            think: Timer::from_seconds(rng.gen_range(WANDER_CHANGE_MIN..WANDER_CHANGE_MAX), TimerMode::Once),
+            roam_dir: random_cardinal(),
+            awareness: 0.0,
+        },
     ));
 
     spawns.next = (spawns.next + 1) % spawns.points.len();
@@ -487,6 +624,30 @@ fn overlaps_any(pos: Vec2, half: Vec2, walls: &Query<(&Transform, &Size), With<W
         }
     }
     false
+}
+
+// Map any vector to a single cardinal unit direction (right, left, up, down) or ZERO if input is zero.
+// Tie-breaker: when |x| == |y|, horizontal is preferred.
+fn quantize_to_cardinal(v: Vec2) -> Vec2 {
+    if v.x == 0.0 && v.y == 0.0 {
+        return Vec2::ZERO;
+    }
+    let ax = v.x.abs();
+    let ay = v.y.abs();
+    if ax >= ay {
+        Vec2::new(v.x.signum(), 0.0)
+    } else {
+        Vec2::new(0.0, v.y.signum())
+    }
+}
+
+fn random_cardinal() -> Vec2 {
+    match thread_rng().gen_range(0..4) {
+        0 => Vec2::X,
+        1 => -Vec2::X,
+        2 => Vec2::Y,
+        _ => -Vec2::Y,
+    }
 }
 
 enum Axis { X, Y }
